@@ -63,9 +63,11 @@
       button.is-active { background: #e9f9f0; border-color: rgba(0, 185, 86, 0.45); color: #037536; }
       .legend { margin-left: auto; display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 13px; }
       .legend span { display: inline-flex; align-items: center; gap: 6px; }
+      .drag-hint { width: 100%; color: var(--muted); font-size: 12px; }
       .swatch { width: 20px; height: 3px; border-radius: 99px; display: inline-block; }
       .chart-wrap { position: relative; height: min(72vh, 720px); min-height: 480px; padding: 18px; }
-      canvas { display: block; width: 100%; height: 100%; }
+      canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+      canvas.is-dragging { cursor: grabbing; }
       .tooltip {
         position: absolute;
         display: none;
@@ -112,6 +114,7 @@
             <span><i class="swatch" style="background: var(--green)"></i>Fear & Greed</span>
             <span><i class="swatch" style="background: rgba(255, 59, 79, .2); height: 10px;"></i>≤30 恐惧区</span>
           </div>
+          <div class="drag-hint">在图表区域按住左右拖动，可平移当前时间窗口；触控板横向滚动也支持。</div>
         </div>
         <div class="chart-wrap">
           <canvas id="chart"></canvas>
@@ -130,6 +133,9 @@
       const ctx = canvas.getContext("2d");
       let range = "all";
       let hoverIndex = -1;
+      let visibleStart = allPoints[0].t;
+      let visibleEnd = allPoints.at(-1).t;
+      let dragState = null;
 
       period.textContent = payload.meta.period;
       foot.textContent = `${payload.meta.source}。${payload.meta.note}`;
@@ -137,13 +143,40 @@
       const fmt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
       const fmtFg = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
 
-      function pointsForRange() {
-        if (range === "all") return allPoints;
-        const years = range === "5y" ? 5 : range === "3y" ? 3 : 1;
+      function clampWindow(start, end) {
+        const fullStart = allPoints[0].t;
+        const fullEnd = allPoints.at(-1).t;
+        const span = end - start;
+        if (span >= fullEnd - fullStart) return [fullStart, fullEnd];
+        if (start < fullStart) return [fullStart, fullStart + span];
+        if (end > fullEnd) return [fullEnd - span, fullEnd];
+        return [start, end];
+      }
+
+      function setRangeWindow(nextRange) {
+        range = nextRange;
         const last = allPoints.at(-1).t;
+        if (range === "all") {
+          [visibleStart, visibleEnd] = [allPoints[0].t, last];
+          return;
+        }
+        const years = range === "5y" ? 5 : range === "3y" ? 3 : 1;
         const cutoff = new Date(last);
         cutoff.setFullYear(cutoff.getFullYear() - years);
-        return allPoints.filter((p) => p.t >= cutoff.getTime());
+        [visibleStart, visibleEnd] = clampWindow(cutoff.getTime(), last);
+      }
+
+      function panWindow(deltaPixels) {
+        const plot = canvas._plot;
+        if (!plot) return;
+        const span = visibleEnd - visibleStart;
+        const plotWidth = Math.max(1, plot.x1 - plot.x0);
+        const deltaTime = -(deltaPixels / plotWidth) * span;
+        [visibleStart, visibleEnd] = clampWindow(visibleStart + deltaTime, visibleEnd + deltaTime);
+      }
+
+      function pointsForRange() {
+        return allPoints.filter((p) => p.t >= visibleStart && p.t <= visibleEnd);
       }
 
       function resize() {
@@ -188,6 +221,7 @@
         if (!points.length) return;
         const pad = { left: 64, right: 62, top: 30, bottom: 52 };
         const plot = { x0: pad.left, x1: width - pad.right, y0: pad.top, y1: height - pad.bottom };
+        canvas._plot = plot;
         const minT = points[0].t;
         const maxT = points.at(-1).t;
         const indexValues = points.flatMap((p) => [p.spy, p.qqq]);
@@ -300,15 +334,67 @@
         draw();
       }
 
+      function handlePointerDown(event) {
+        const plot = canvas._plot;
+        const rect = canvas.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        if (!plot || x < plot.x0 || x > plot.x1) return;
+        dragState = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          lastX: event.clientX,
+          moved: false,
+        };
+        canvas.classList.add("is-dragging");
+        canvas.setPointerCapture(event.pointerId);
+      }
+
+      function handlePointerMove(event) {
+        if (!dragState || dragState.pointerId !== event.pointerId) {
+          updateTooltip(event);
+          return;
+        }
+        const delta = event.clientX - dragState.lastX;
+        if (Math.abs(event.clientX - dragState.startX) > 3) dragState.moved = true;
+        dragState.lastX = event.clientX;
+        panWindow(delta);
+        hoverIndex = -1;
+        tooltip.style.display = "none";
+        draw();
+      }
+
+      function endPointerDrag(event) {
+        if (!dragState || dragState.pointerId !== event.pointerId) return;
+        canvas.releasePointerCapture(event.pointerId);
+        canvas.classList.remove("is-dragging");
+        dragState = null;
+      }
+
+      function handleWheel(event) {
+        const horizontalDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : 0;
+        if (!horizontalDelta) return;
+        event.preventDefault();
+        panWindow(-horizontalDelta);
+        hoverIndex = -1;
+        tooltip.style.display = "none";
+        draw();
+      }
+
       canvas.addEventListener("mousemove", updateTooltip);
+      canvas.addEventListener("pointerdown", handlePointerDown);
+      canvas.addEventListener("pointermove", handlePointerMove);
+      canvas.addEventListener("pointerup", endPointerDrag);
+      canvas.addEventListener("pointercancel", endPointerDrag);
+      canvas.addEventListener("wheel", handleWheel, { passive: false });
       canvas.addEventListener("mouseleave", () => {
+        if (dragState) return;
         hoverIndex = -1;
         tooltip.style.display = "none";
         draw();
       });
       document.querySelectorAll("[data-range]").forEach((button) => {
         button.addEventListener("click", () => {
-          range = button.dataset.range;
+          setRangeWindow(button.dataset.range);
           document.querySelectorAll("[data-range]").forEach((item) => item.classList.toggle("is-active", item === button));
           hoverIndex = -1;
           tooltip.style.display = "none";
@@ -316,6 +402,7 @@
         });
       });
       window.addEventListener("resize", resize);
+      setRangeWindow("all");
       resize();
     </script>
   </body>
